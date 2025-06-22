@@ -5,90 +5,87 @@ from domain.models import (
     EvaluationDataset, EvaluationData, EvaluationStatus, EvaluationMetric,
     InputData, ExpectedResult, EvaluationDataType, MetricsData
 )
-from domain.services import DatasetDomainService
+from domain.services import DatasetDomainService, DomainEvaluationService # Imports from domain services
 from ports.llm_service import ILLMService
 from ports.metrics_calculator import IMetricsCalculator
 from ports.repositories import (
     IEvaluationDomainDataRepository, IEvaluationDatasetRepository, IMetricsDetailRepository
 )
 from ports.synthetic_data_generator import ISyntheticDataGenerator
-from adapters.parsers.excel_parser import ExcelParser # Used by ImportEvaluationDataUseCase
+from adapters.parsers.excel_parser import ExcelParser
 
 class EvaluateDatasetUseCase:
     """
     Use case for evaluating a given dataset against an LLM and calculating metrics.
+    Orchestrates the evaluation process, delegating single data point evaluation
+    to the DomainEvaluationService.
     """
     def __init__(self,
-                 llm_service: ILLMService,
-                 metrics_calculator: IMetricsCalculator,
+                 domain_evaluation_service: DomainEvaluationService,
                  evaluation_data_repo: IEvaluationDomainDataRepository,
                  evaluation_dataset_repo: IEvaluationDatasetRepository):
-        self.llm_service = llm_service
-        self.metrics_calculator = metrics_calculator
+        self.domain_evaluation_service = domain_evaluation_service
         self.evaluation_data_repo = evaluation_data_repo
         self.evaluation_dataset_repo = evaluation_dataset_repo
 
     def execute(self, dataset_id: str, llm_model_name: str, metric_type: EvaluationMetric) -> EvaluationDataset:
         """
         Executes the evaluation process for a specified dataset.
+        For each evaluation data point, it calls the DomainEvaluationService
+        to get LLM responses and calculate metric scores.
+
+        Reliability & Resiliency Note:
+        For production systems with large datasets, this loop might be slow and
+        prone to timeouts. Consider:
+        1. Offloading evaluation tasks to a background worker/task queue (e.g., Celery, Kafka Streams).
+        2. Implementing idempotent operations (e.g., a "resume evaluation" feature).
+        3. Monitoring progress and retrying failed individual evaluation data points.
+
         :param dataset_id: The ID of the dataset to evaluate.
         :param llm_model_name: The name of the LLM model to use for generating responses.
         :param metric_type: The metric to use for calculating scores (e.g., ROUGE_L).
         :return: The updated EvaluationDataset after evaluation.
-        :raises ValueError: If the dataset is not found or metric type is unsupported.
+        :raises ValueError: If the dataset is not found or metric type is unsupported by the domain service.
         """
         dataset = self.evaluation_dataset_repo.get_by_id(dataset_id)
         if not dataset:
             raise ValueError(f"Dataset with ID {dataset_id} not found.")
 
-        if not self.metrics_calculator.supports_metric_type(metric_type):
-            raise ValueError(f"Metric type {metric_type} not supported by the current metrics calculator.")
-
-        # Update dataset status to indicate evaluation is in progress
         dataset.set_status(EvaluationStatus.IN_PROGRESS)
-        self.evaluation_dataset_repo.update(dataset)
+        self.evaluation_dataset_repo.update(dataset) # Persist status change
 
         for eval_data in dataset.evaluation_data:
-            eval_data.set_status(EvaluationStatus.IN_PROGRESS)
-            self.evaluation_data_repo.update(eval_data)
-            try:
-                # 1. Get LLM Response
-                prompt = eval_data.input_data.decoded_data
-                llm_response = self.llm_service.get_llm_response(prompt, llm_model_name)
-                eval_data.record_llm_response(llm_response)
+            # Delegate the core evaluation logic for a single data point to the domain service
+            updated_eval_data = self.domain_evaluation_service.evaluate_single_data_point(
+                eval_data=eval_data,
+                llm_model_name=llm_model_name,
+                metric_type=metric_type
+            )
+            # Persist the updated evaluation data point state
+            self.evaluation_data_repo.update(updated_eval_data)
 
-                # 2. Calculate Metric Score
-                expected_output = eval_data.expected_result.decoded_result
-                metric_result = self.metrics_calculator.calculate_score(expected_output, llm_response)
-                eval_data.add_metric_result(metric_result)
-                eval_data.set_status(EvaluationStatus.COMPLETED)
-            except Exception as e:
-                eval_data.set_status(EvaluationStatus.FAILED, str(e))
-                print(f"Error evaluating data {eval_data.evaluation_id}: {e}")
-            finally:
-                self.evaluation_data_repo.update(eval_data)
-
-        # Calculate overall score for the dataset
+        # Calculate overall score for the dataset (using domain service)
         overall_score = DatasetDomainService.calculate_overall_dataset_score(dataset, metric_type)
         dataset.overall_score = overall_score
         dataset.set_status(EvaluationStatus.COMPLETED)
         # Store the LLM model name in dataset metadata for leaderboard
         if "llm_model_name" not in dataset.metadata:
             dataset.metadata["llm_model_name"] = llm_model_name
-        self.evaluation_dataset_repo.update(dataset)
+        self.evaluation_dataset_repo.update(dataset) # Persist final dataset status and score
         return dataset
 
 class ManageDomainDatasetsUseCase:
     """
     Use case for managing evaluation datasets, including creation and synthetic data generation.
+    This now uses the DomainEvaluationService as a single entry point for synthetic data generation.
     """
     def __init__(self,
                  evaluation_dataset_repo: IEvaluationDatasetRepository,
                  metrics_detail_repo: IMetricsDetailRepository,
-                 synthetic_data_generator: ISyntheticDataGenerator):
+                 domain_evaluation_service: DomainEvaluationService): # NEW Dependency
         self.evaluation_dataset_repo = evaluation_dataset_repo
         self.metrics_detail_repo = metrics_detail_repo
-        self.synthetic_data_generator = synthetic_data_generator
+        self.domain_evaluation_service = domain_evaluation_service # Use the domain service for synthetic data
 
     def create_evaluation_dataset(self,
                                   sub_domain_id: str,
@@ -139,7 +136,7 @@ class ManageDomainDatasetsUseCase:
 
     def generate_and_add_synthetic_data(self, dataset_id: str, num_samples: int):
         """
-        Generates synthetic data and adds it to an existing dataset.
+        Generates synthetic data (via DomainEvaluationService) and adds it to an existing dataset.
         :param dataset_id: The ID of the dataset to add data to.
         :param num_samples: The number of synthetic samples to generate.
         :raises ValueError: If dataset not found or synthetic data fails validation.
@@ -148,9 +145,11 @@ class ManageDomainDatasetsUseCase:
         if not dataset:
             raise ValueError(f"Dataset with ID {dataset_id} not found.")
 
-        synthetic_data = self.synthetic_data_generator.generate_synthetic_data(num_samples, dataset.ai_task_name)
-        if not self.synthetic_data_generator.validate_synthetic_data(synthetic_data):
-            raise ValueError("Generated synthetic data failed validation.")
+        # Call the domain service for synthetic data generation and validation
+        synthetic_data = self.domain_evaluation_service.generate_and_validate_synthetic_data_domain(
+            num_samples=num_samples,
+            task_name=dataset.ai_task_name
+        )
 
         for data in synthetic_data:
             dataset.add_evaluation_data(data)

@@ -1,32 +1,38 @@
 import yaml
 import os
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+import sys
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import List, Optional
 
 # Import domain models
-from src.domain.models import EvaluationStatus, EvaluationMetric, EvaluationDataset
+from domain.models import EvaluationStatus, EvaluationMetric, EvaluationDataset
 
 # Import domain services
-from src.domain.services import DatasetDomainService
+from domain.services import DatasetDomainService, DomainEvaluationService
+
+# NEW: Import domain-internal metrics and synthetic data
+from domain.metrics import SummarizationMetrics # NEW Import
+from domain.synthetic_data import BasicSyntheticDataGenerator # NEW Import
 
 # Import ports
-from src.ports.llm_service import ILLMService
-from src.ports.metrics_calculator import IMetricsCalculator
-from src.ports.repositories import IEvaluationDomainDataRepository, IEvaluationDatasetRepository, IMetricsDetailRepository
-from src.ports.synthetic_data_generator import ISyntheticDataGenerator
+from ports.authentication_service import IAuthenticationService
+from ports.llm_service import ILLMService
+from ports.metrics_calculator import IMetricsCalculator # Still used for type hinting and interface
+from ports.repositories import IEvaluationDomainDataRepository, IEvaluationDatasetRepository, IMetricsDetailRepository
+from ports.synthetic_data_generator import ISyntheticDataGenerator # Still used for type hinting and interface
 
 # Import adapters
-from src.adapters.llm.openai_adapter import OpenAIAdapter
-from src.adapters.metrics.summarization_metrics import SummarizationMetrics
-from src.adapters.repositories.in_memory_respository import (
+from adapters.authentication.basic_auth_adapter import BasicAuthAdapter
+from adapters.llm.openai_adapter import OpenAIAdapter
+from adapters.repositories.in_memory_repository import (
     InMemoryEvaluationDomainDataRepository,
     InMemoryEvaluationDatasetRepository,
     InMemoryMetricsDetailRepository
 )
 from adapters.parsers.excel_parser import ExcelParser
-from adapters.synthetic_data.basic_generator import BasicSyntheticDataGenerator
 
 # Import use cases
 from application.use_cases import (
@@ -37,7 +43,7 @@ from application.use_cases import (
 )
 
 # Import console printer for leaderboard
-from src.interfaces.console_leaderboard import ConsoleLeaderboardPrinter
+from interfaces.console_leaderboard import ConsoleLeaderboardPrinter
 
 # --- Configuration Loading ---
 def load_config(config_path: str = "configs/config.yaml"):
@@ -47,7 +53,6 @@ def load_config(config_path: str = "configs/config.yaml"):
             return yaml.safe_load(f)
     except FileNotFoundError:
         print(f"Error: Config file not found at {config_path}. Please create it.")
-        # Exit to force user to create config
         os._exit(1) # Using os._exit to immediately terminate process
     except yaml.YAMLError as e:
         print(f"Error parsing config file: {e}")
@@ -62,7 +67,7 @@ evaluation_data_repo = InMemoryEvaluationDomainDataRepository()
 evaluation_dataset_repo = InMemoryEvaluationDatasetRepository()
 metrics_detail_repo = InMemoryMetricsDetailRepository()
 
-# Initialize Adapters
+# Initialize Adapters (External Dependencies)
 openai_api_key = config.get("openai_api_key")
 if not openai_api_key or openai_api_key == "YOUR_OPENAI_API_KEY_HERE":
     raise ValueError(
@@ -70,20 +75,36 @@ if not openai_api_key or openai_api_key == "YOUR_OPENAI_API_KEY_HERE":
         "Please set 'openai_api_key' in configs/config.yaml with your actual key."
     )
 llm_service: ILLMService = OpenAIAdapter(api_key=openai_api_key)
-metrics_calculator: IMetricsCalculator = SummarizationMetrics()
+
+# NEW: Initialize domain-internal components (implementing ports)
+# These are instantiated here in the application layer and then passed into domain services.
+metrics_calculator_impl: IMetricsCalculator = SummarizationMetrics() # Now from domain.metrics
+synthetic_data_generator_impl: ISyntheticDataGenerator = BasicSyntheticDataGenerator() # Now from domain.synthetic_data
+
 excel_parser = ExcelParser()
-synthetic_data_generator: ISyntheticDataGenerator = BasicSyntheticDataGenerator()
+
+# Initialize Authentication Adapter
+auth_config = config.get("auth", {})
+USERS_DB = {auth_config.get("username"): auth_config.get("password")}
+authentication_service: IAuthenticationService = BasicAuthAdapter(users=USERS_DB)
+security = HTTPBasic() # FastAPI's built-in Basic Auth utility
+
+# Initialize Domain Services
+domain_evaluation_service = DomainEvaluationService(
+    llm_service=llm_service, # External adapter
+    metrics_calculator=metrics_calculator_impl, # Domain-internal component (implements port)
+    synthetic_data_generator=synthetic_data_generator_impl # Domain-internal component (implements port)
+)
 
 # Initialize Use Cases
 manage_domain_datasets_uc = ManageDomainDatasetsUseCase(
     evaluation_dataset_repo=evaluation_dataset_repo,
     metrics_detail_repo=metrics_detail_repo,
-    synthetic_data_generator=synthetic_data_generator
+    domain_evaluation_service=domain_evaluation_service # Now depends on the unified domain service
 )
 
 evaluate_dataset_uc = EvaluateDatasetUseCase(
-    llm_service=llm_service,
-    metrics_calculator=metrics_calculator,
+    domain_evaluation_service=domain_evaluation_service,
     evaluation_data_repo=evaluation_data_repo,
     evaluation_dataset_repo=evaluation_dataset_repo
 )
@@ -116,6 +137,21 @@ def get_leaderboard_generation_uc() -> LeaderboardGenerationUseCase:
 def get_evaluation_dataset_repo() -> IEvaluationDatasetRepository:
     return evaluation_dataset_repo
 
+# Dependency for Authentication
+def get_current_user(credentials: HTTPBasicCredentials = Depends(security)) -> str:
+    """
+    Authenticates the user based on Basic HTTP credentials.
+    Returns the username if authenticated, otherwise raises an HTTPException.
+    """
+    user_id = authentication_service.authenticate_user(credentials.username, credentials.password)
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return user_id
+
 # --- API Endpoints ---
 
 class FileUploadRequest(BaseModel):
@@ -129,12 +165,14 @@ async def upload_evaluation_data(
     task_name: str = "Summarization",
     sub_domain_id: str = "general",
     sheet_name: Optional[str] = None,
-    import_uc: ImportEvaluationDataUseCase = Depends(get_import_evaluation_data_uc)
+    import_uc: ImportEvaluationDataUseCase = Depends(get_import_evaluation_data_uc),
+    current_user: str = Depends(get_current_user) # PROTECTED endpoint
 ):
     """
     Uploads an Excel file containing 'input_text' and 'expected_output'
-    to create an evaluation dataset.
+    to create an evaluation dataset. This endpoint is protected by basic authentication.
     """
+    print(f"Authenticated user: {current_user} is uploading data.")
     if not file.filename.endswith(('.xlsx', '.xls')):
         raise HTTPException(status_code=400, detail="Invalid file type. Only Excel files (.xlsx, .xls) are allowed.")
 
@@ -160,12 +198,15 @@ class EvaluateDatasetRequest(BaseModel):
 @app.post("/evaluate-dataset/", summary="Trigger evaluation of a dataset")
 async def evaluate_dataset_endpoint(
     request: EvaluateDatasetRequest,
-    evaluate_uc: EvaluateDatasetUseCase = Depends(get_evaluate_dataset_uc)
+    evaluate_uc: EvaluateDatasetUseCase = Depends(get_evaluate_dataset_uc),
+    current_user: str = Depends(get_current_user) # PROTECTED endpoint
 ):
     """
     Triggers evaluation of a dataset using a specified LLM model and metric.
     The LLM responses are generated, and metric scores are calculated.
+    This endpoint is protected by basic authentication.
     """
+    print(f"Authenticated user: {current_user} is triggering evaluation for dataset {request.dataset_id}.")
     try:
         evaluated_dataset = evaluate_uc.execute(request.dataset_id, request.llm_model_name, request.metric_type)
         return JSONResponse(status_code=200, content={
@@ -185,6 +226,7 @@ async def get_all_datasets(
 ):
     """
     Retrieves a list of all available evaluation datasets.
+    This endpoint is intentionally left unprotected for easy viewing of available datasets.
     """
     datasets = repo.get_all()
     # Convert Enum to string for JSON serialization
@@ -197,6 +239,7 @@ async def get_dataset_by_id(
 ):
     """
     Retrieves a specific evaluation dataset by its ID.
+    This endpoint is intentionally left unprotected for easy viewing of available datasets.
     """
     dataset = repo.get_by_id(dataset_id)
     if not dataset:
@@ -213,6 +256,7 @@ async def get_leaderboard_endpoint(
     """
     Generates and returns the leaderboard for a specific AI task and metric.
     The detailed leaderboard output is printed to the console where the FastAPI app is running.
+    This endpoint is intentionally left unprotected for public viewing of results.
     """
     try:
         leaderboard = leaderboard_uc.execute(ai_task_name, metric_type)
@@ -227,3 +271,25 @@ async def get_leaderboard_endpoint(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating leaderboard: {e}")
 
+# Basic token endpoint for demonstration (optional, just to show auth flow)
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+@app.post("/token", response_model=TokenResponse, summary="Get an authentication token (Basic Auth)")
+async def login_for_access_token(credentials: HTTPBasicCredentials = Depends(security)):
+    """
+    Authenticate with username/password to get a dummy access token.
+    Use this token for subsequent protected requests.
+    """
+    user_id = authentication_service.authenticate_user(credentials.username, credentials.password)
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    # In a real app, generate a JWT here
+    token = f"dummy_token_for_{user_id}"
+    # The BasicAuthAdapter already "stores" the dummy token associated with the user.
+    return {"access_token": token}
