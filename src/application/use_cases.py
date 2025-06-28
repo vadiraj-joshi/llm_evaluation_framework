@@ -1,17 +1,14 @@
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Any
 
 from domain.models import (
     EvaluationDataset, EvaluationData, EvaluationStatus, EvaluationMetric,
     InputData, ExpectedResult, EvaluationDataType, MetricsData
 )
-from domain.services import DatasetDomainService, DomainEvaluationService # Imports from domain services
-from ports.llm_service import ILLMService
-from ports.metrics_calculator import IMetricsCalculator
+from domain.services import DatasetDomainService, DomainEvaluationService
 from ports.repositories import (
     IEvaluationDomainDataRepository, IEvaluationDatasetRepository, IMetricsDetailRepository
 )
-from ports.synthetic_data_generator import ISyntheticDataGenerator
 from adapters.parsers.excel_parser import ExcelParser
 
 class EvaluateDatasetUseCase:
@@ -28,37 +25,43 @@ class EvaluateDatasetUseCase:
         self.evaluation_data_repo = evaluation_data_repo
         self.evaluation_dataset_repo = evaluation_dataset_repo
 
-    def execute(self, dataset_id: str, llm_model_name: str, metric_type: EvaluationMetric) -> EvaluationDataset:
+    def execute(self, dataset_id: str, llm_model_name: str, ai_task_name: str, metric_type: EvaluationMetric) -> EvaluationDataset:
         """
         Executes the evaluation process for a specified dataset.
         For each evaluation data point, it calls the DomainEvaluationService
         to get LLM responses and calculate metric scores.
 
-        Reliability & Resiliency Note:
-        For production systems with large datasets, this loop might be slow and
-        prone to timeouts. Consider:
-        1. Offloading evaluation tasks to a background worker/task queue (e.g., Celery, Kafka Streams).
-        2. Implementing idempotent operations (e.g., a "resume evaluation" feature).
-        3. Monitoring progress and retrying failed individual evaluation data points.
+        Scalability, Reliability & Resiliency Note:
+        For production systems with large datasets (e.g., >100 rows), this synchronous
+        loop within an API request is a bottleneck. Consider:
+        1.  **Asynchronous Task Queues (Scalability/Reliability/Availability):** Offload each `evaluate_single_data_point` call to a message queue (e.g., Kafka, RabbitMQ) and process them with dedicated worker services (e.g., Celery workers, Kubernetes Jobs). The API would then return an immediate "Evaluation initiated" status. This provides resilience to API timeouts and allows horizontal scaling of workers.
+        2.  **Distributed Processing:** For very large datasets, use frameworks like Apache Spark or Dask to process evaluation data in parallel across a cluster.
+        3.  **Idempotency & Checkpointing (Reliability):** Ensure the evaluation process is idempotent. If a worker fails, it can pick up from where it left off without duplicating effort.
+        4.  **Circuit Breakers/Bulkheads (Resiliency):** For LLM calls, implement more sophisticated patterns to isolate failures and prevent cascading issues.
 
         :param dataset_id: The ID of the dataset to evaluate.
         :param llm_model_name: The name of the LLM model to use for generating responses.
-        :param metric_type: The metric to use for calculating scores (e.g., ROUGE_L).
+        :param ai_task_name: The specific AI task (e.g., "Summarization", "Translation").
+        :param metric_type: The metric to use for calculating scores (e.g., ROUGE_L, BLEU, ACCURACY).
         :return: The updated EvaluationDataset after evaluation.
         :raises ValueError: If the dataset is not found or metric type is unsupported by the domain service.
         """
         dataset = self.evaluation_dataset_repo.get_by_id(dataset_id)
         if not dataset:
             raise ValueError(f"Dataset with ID {dataset_id} not found.")
+        
+        # Override dataset's AI task name if the user provides it, to ensure consistency in evaluation
+        dataset.ai_task_name = ai_task_name 
 
         dataset.set_status(EvaluationStatus.IN_PROGRESS)
         self.evaluation_dataset_repo.update(dataset) # Persist status change
 
         for eval_data in dataset.evaluation_data:
-            # Delegate the core evaluation logic for a single data point to the domain service
+            # Delegate the core evaluation logic for a single data point to the domain service.
             updated_eval_data = self.domain_evaluation_service.evaluate_single_data_point(
                 eval_data=eval_data,
                 llm_model_name=llm_model_name,
+                ai_task_name=ai_task_name, # Pass task name for prompt building and metric selection
                 metric_type=metric_type
             )
             # Persist the updated evaluation data point state
@@ -68,9 +71,9 @@ class EvaluateDatasetUseCase:
         overall_score = DatasetDomainService.calculate_overall_dataset_score(dataset, metric_type)
         dataset.overall_score = overall_score
         dataset.set_status(EvaluationStatus.COMPLETED)
-        # Store the LLM model name in dataset metadata for leaderboard
-        if "llm_model_name" not in dataset.metadata:
-            dataset.metadata["llm_model_name"] = llm_model_name
+        # Store the LLM model name and metric used in dataset metadata for leaderboard
+        dataset.metadata["llm_model_name"] = llm_model_name
+        dataset.metadata["metric_for_score"] = metric_type.value
         self.evaluation_dataset_repo.update(dataset) # Persist final dataset status and score
         return dataset
 
@@ -82,10 +85,10 @@ class ManageDomainDatasetsUseCase:
     def __init__(self,
                  evaluation_dataset_repo: IEvaluationDatasetRepository,
                  metrics_detail_repo: IMetricsDetailRepository,
-                 domain_evaluation_service: DomainEvaluationService): # NEW Dependency
+                 domain_evaluation_service: DomainEvaluationService): # Depends on the unified domain service
         self.evaluation_dataset_repo = evaluation_dataset_repo
         self.metrics_detail_repo = metrics_detail_repo
-        self.domain_evaluation_service = domain_evaluation_service # Use the domain service for synthetic data
+        self.domain_evaluation_service = domain_evaluation_service
 
     def create_evaluation_dataset(self,
                                   sub_domain_id: str,
@@ -188,14 +191,14 @@ class LeaderboardGenerationUseCase:
         leaderboard_entries = []
 
         for dataset in all_datasets:
-            # Only include completed datasets for the specified task
-            if dataset.ai_task_name == ai_task_name and dataset.status == EvaluationStatus.COMPLETED:
-                # Ensure overall_score is calculated for the specified metric
-                # If not present or if the metric used for stored score differs, recalculate
-                if dataset.overall_score is None or dataset.metadata.get("metric_for_score") != metric_type.value:
-                    dataset.overall_score = DatasetDomainService.calculate_overall_dataset_score(dataset, metric_type)
-                    dataset.metadata["metric_for_score"] = metric_type.value
-                    self.evaluation_dataset_repo.update(dataset) # Persist the score
+            # Only include completed datasets for the specified task and if they have score for chosen metric
+            if dataset.ai_task_name == ai_task_name and \
+               dataset.status == EvaluationStatus.COMPLETED and \
+               dataset.metadata.get("metric_for_score") == metric_type.value: # Check if evaluated with this metric
+                
+                # We assume overall_score is already calculated and stored for this metric type.
+                # If not, DatasetDomainService.calculate_overall_dataset_score would be called here.
+                # For this iteration, we rely on `evaluate_dataset_endpoint` to store the score.
 
                 leaderboard_entries.append({
                     "dataset_id": dataset.dataset_id,
@@ -227,6 +230,7 @@ class ImportEvaluationDataUseCase:
         """
         Imports evaluation data from an Excel file, creates EvaluationData objects,
         and adds them to a new or existing EvaluationDataset.
+        Handles parsing specific columns for different task types.
         :param file_content: The binary content of the Excel file.
         :param task_name: The AI task name for the imported data.
         :param sub_domain_id: The subdomain ID for the imported data.
@@ -238,8 +242,19 @@ class ImportEvaluationDataUseCase:
 
         evaluation_data_list = []
         for item in parsed_data:
-            input_data = InputData(data_type=EvaluationDataType.TEXT, decoded_data=item['input_text'])
-            expected_result = ExpectedResult(decoded_result=item['expected_output'])
+            input_data_kwargs = {
+                "data_type": EvaluationDataType.TEXT,
+                "decoded_data": item['input_text'],
+                "context": item.get('context') # Pass context if available
+            }
+            input_data = InputData(**input_data_kwargs)
+
+            expected_result_kwargs = {
+                "decoded_result": item['expected_output'],
+                "labels": item.get('labels') # Pass labels if available
+            }
+            expected_result = ExpectedResult(**expected_result_kwargs)
+            
             eval_data = EvaluationData(
                 evaluation_id=str(uuid.uuid4()),
                 input_data=input_data,
@@ -248,7 +263,7 @@ class ImportEvaluationDataUseCase:
             )
             evaluation_data_list.append(eval_data)
 
-        # Create a new dataset (for simplicity, always creating a new one here)
+        # Create a new dataset
         dataset = self.manage_domain_datasets_use_case.create_evaluation_dataset(
             sub_domain_id=sub_domain_id,
             ai_task_name=task_name,

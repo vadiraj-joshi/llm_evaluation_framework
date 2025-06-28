@@ -5,7 +5,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 # Import domain models
 from domain.models import EvaluationStatus, EvaluationMetric, EvaluationDataset
@@ -13,16 +13,16 @@ from domain.models import EvaluationStatus, EvaluationMetric, EvaluationDataset
 # Import domain services
 from domain.services import DatasetDomainService, DomainEvaluationService
 
-# NEW: Import domain-internal metrics and synthetic data
-from domain.metrics import SummarizationMetrics # NEW Import
-from domain.synthetic_data import BasicSyntheticDataGenerator # NEW Import
+# Import domain-internal metrics and synthetic data factories
+from domain.metrics import MetricCalculatorFactory # NEW Import
+from domain.synthetic_data import SyntheticDataGeneratorFactory # NEW Import
 
 # Import ports
 from ports.authentication_service import IAuthenticationService
 from ports.llm_service import ILLMService
-from ports.metrics_calculator import IMetricsCalculator # Still used for type hinting and interface
+from ports.metrics_calculator import IMetricsCalculator # Still for type hinting interface
 from ports.repositories import IEvaluationDomainDataRepository, IEvaluationDatasetRepository, IMetricsDetailRepository
-from ports.synthetic_data_generator import ISyntheticDataGenerator # Still used for type hinting and interface
+from ports.synthetic_data_generator import ISyntheticDataGenerator # Still for type hinting interface
 
 # Import adapters
 from adapters.authentication.basic_auth_adapter import BasicAuthAdapter
@@ -78,8 +78,8 @@ llm_service: ILLMService = OpenAIAdapter(api_key=openai_api_key)
 
 # NEW: Initialize domain-internal components (implementing ports)
 # These are instantiated here in the application layer and then passed into domain services.
-metrics_calculator_impl: IMetricsCalculator = SummarizationMetrics() # Now from domain.metrics
-synthetic_data_generator_impl: ISyntheticDataGenerator = BasicSyntheticDataGenerator() # Now from domain.synthetic_data
+metric_calculator_factory = MetricCalculatorFactory() # NEW
+synthetic_data_generator_factory = SyntheticDataGeneratorFactory() # NEW
 
 excel_parser = ExcelParser()
 
@@ -92,8 +92,8 @@ security = HTTPBasic() # FastAPI's built-in Basic Auth utility
 # Initialize Domain Services
 domain_evaluation_service = DomainEvaluationService(
     llm_service=llm_service, # External adapter
-    metrics_calculator=metrics_calculator_impl, # Domain-internal component (implements port)
-    synthetic_data_generator=synthetic_data_generator_impl # Domain-internal component (implements port)
+    metric_calculator_factory=metric_calculator_factory, # NEW: Factory for metrics
+    synthetic_data_generator_factory=synthetic_data_generator_factory # NEW: Factory for synthetic data
 )
 
 # Initialize Use Cases
@@ -155,13 +155,13 @@ def get_current_user(credentials: HTTPBasicCredentials = Depends(security)) -> s
 # --- API Endpoints ---
 
 class FileUploadRequest(BaseModel):
-    task_name: str = "Summarization"
+    task_name: str = "Summarization" # Default task
     sub_domain_id: str = "general"
     sheet_name: Optional[str] = None
 
 @app.post("/upload-evaluation-data/", summary="Upload Excel data for evaluation")
 async def upload_evaluation_data(
-    file: UploadFile = File(..., description="Excel file containing 'input_text' and 'expected_output' columns."),
+    file: UploadFile = File(..., description="Excel file containing 'input_text', 'expected_output'. Optional: 'context', 'labels'."),
     task_name: str = "Summarization",
     sub_domain_id: str = "general",
     sheet_name: Optional[str] = None,
@@ -169,10 +169,12 @@ async def upload_evaluation_data(
     current_user: str = Depends(get_current_user) # PROTECTED endpoint
 ):
     """
-    Uploads an Excel file containing 'input_text' and 'expected_output'
-    to create an evaluation dataset. This endpoint is protected by basic authentication.
+    Uploads an Excel file containing evaluation data for various LLM tasks.
+    Required columns: 'input_text', 'expected_output'.
+    Optional for specific tasks: 'context' (for RAG), 'labels' (for Classification - comma separated).
+    This endpoint is protected by basic authentication.
     """
-    print(f"Authenticated user: {current_user} is uploading data.")
+    print(f"Authenticated user: {current_user} is uploading data for task: {task_name}.")
     if not file.filename.endswith(('.xlsx', '.xls')):
         raise HTTPException(status_code=400, detail="Invalid file type. Only Excel files (.xlsx, .xls) are allowed.")
 
@@ -193,7 +195,8 @@ async def upload_evaluation_data(
 class EvaluateDatasetRequest(BaseModel):
     dataset_id: str
     llm_model_name: str
-    metric_type: EvaluationMetric = EvaluationMetric.ROUGE_L
+    ai_task_name: str # e.g., Summarization, Translation, Classification, RAG
+    metric_type: EvaluationMetric = EvaluationMetric.ROUGE_L # Default, but should match task
 
 @app.post("/evaluate-dataset/", summary="Trigger evaluation of a dataset")
 async def evaluate_dataset_endpoint(
@@ -202,13 +205,14 @@ async def evaluate_dataset_endpoint(
     current_user: str = Depends(get_current_user) # PROTECTED endpoint
 ):
     """
-    Triggers evaluation of a dataset using a specified LLM model and metric.
+    Triggers evaluation of a dataset using a specified LLM model, AI task, and metric.
     The LLM responses are generated, and metric scores are calculated.
     This endpoint is protected by basic authentication.
     """
-    print(f"Authenticated user: {current_user} is triggering evaluation for dataset {request.dataset_id}.")
+    print(f"Authenticated user: {current_user} is triggering evaluation for dataset {request.dataset_id} "
+          f"with model {request.llm_model_name} for task {request.ai_task_name} using metric {request.metric_type.value}.")
     try:
-        evaluated_dataset = evaluate_uc.execute(request.dataset_id, request.llm_model_name, request.metric_type)
+        evaluated_dataset = evaluate_uc.execute(request.dataset_id, request.llm_model_name, request.ai_task_name, request.metric_type)
         return JSONResponse(status_code=200, content={
             "message": "Dataset evaluation initiated/completed.",
             "dataset_id": evaluated_dataset.dataset_id,
@@ -258,6 +262,7 @@ async def get_leaderboard_endpoint(
     The detailed leaderboard output is printed to the console where the FastAPI app is running.
     This endpoint is intentionally left unprotected for public viewing of results.
     """
+    print(f"Generating leaderboard for task: {ai_task_name} with metric: {metric_type.value}.")
     try:
         leaderboard = leaderboard_uc.execute(ai_task_name, metric_type)
         
