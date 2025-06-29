@@ -1,7 +1,7 @@
 
 from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any
-from src.domain.models import EvaluationDataset, EvaluationData, MetricsData
+from domain.models import EvaluationDataset, EvaluationData, MetricsData
 
 class IEvaluationDomainDataRepository(ABC):
     @abstractmethod

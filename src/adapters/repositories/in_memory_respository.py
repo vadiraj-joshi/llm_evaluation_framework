@@ -2,10 +2,10 @@
 from openai import OpenAI
 from openai import APIConnectionError, APIStatusError # Import specific exceptions
 import time
-from src.ports.repositories import IEvaluationDomainDataRepository, IEvaluationDatasetRepository, IMetricsDetailRepository
+from ports.repositories import IEvaluationDomainDataRepository, IEvaluationDatasetRepository, IMetricsDetailRepository
 import uuid
 from typing import List, Optional, Dict, Any
-from src.domain.models import EvaluationData, EvaluationDataset, MetricsData
+from domain.models import EvaluationData, EvaluationDataset, MetricsData
 
 class InMemoryEvaluationDomainDataRepository(IEvaluationDomainDataRepository):
     def __init__(self):

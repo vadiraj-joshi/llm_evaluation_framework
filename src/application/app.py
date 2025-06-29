@@ -27,7 +27,7 @@ from ports.synthetic_data_generator import ISyntheticDataGenerator # Still for t
 # Import adapters
 from adapters.authentication.basic_auth_adapter import BasicAuthAdapter
 from adapters.llm.openai_adapter import OpenAIAdapter
-from adapters.repositories.in_memory_repository import (
+from adapters.repositories.in_memory_respository import (
     InMemoryEvaluationDomainDataRepository,
     InMemoryEvaluationDatasetRepository,
     InMemoryMetricsDetailRepository

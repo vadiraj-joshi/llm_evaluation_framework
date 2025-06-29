@@ -1,6 +1,6 @@
 
 from abc import ABC, abstractmethod
-from src.domain.models import EvaluationMetric, EvaluationResult
+from domain.models import EvaluationMetric, EvaluationResult
 
 class ILLMService(ABC):
     @abstractmethod

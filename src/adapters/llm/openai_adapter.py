@@ -2,7 +2,7 @@
 from openai import OpenAI
 from openai import APIConnectionError, APIStatusError # Import specific exceptions
 import time
-from src.ports.llm_service import ILLMService
+from ports.llm_service import ILLMService
 
 class OpenAIAdapter(ILLMService):
     def __init__(self, api_key: str, model: str = "gpt-3.5-turbo"):

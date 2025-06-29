@@ -1,8 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any
 from rouge_score import rouge_scorer
-from src.ports.metrics_calculator import IMetricsCalculator
-from src.domain.models import EvaluationResult, EvaluationMetric
+from ports.metrics_calculator import IMetricsCalculator
+from domain.models import EvaluationResult, EvaluationMetric
 
 class SummarizationMetrics(IMetricsCalculator):
     def __init__(self):

@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any
-from src.domain.models import EvaluationData
+from domain.models import EvaluationData
 class ISyntheticDataGenerator(ABC):
     @abstractmethod
     def generate_synthetic_data(self, num_samples: int, task_name: str) -> List[EvaluationData]:

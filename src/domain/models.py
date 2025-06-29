@@ -1,14 +1,14 @@
 import uuid
 from pydantic import BaseModel
 from typing import List, Optional
-
-class EvaluationStatus:
+from enum import Enum
+class EvaluationStatus(str, Enum):
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
-class EvaluationMetric:
+class EvaluationMetric(str, Enum):
     # Summarization
     ROUGE_L = "ROUGE_L"
     ROUGE_1 = "ROUGE_1"
@@ -27,7 +27,7 @@ class EvaluationMetric:
     EXACT_MATCH = "EXACT_MATCH" # For Q&A, simple classification
     SEMANTIC_SIMILARITY = "SEMANTIC_SIMILARITY" # Using embeddings
 
-class EvaluationDataType:
+class EvaluationDataType(str, Enum):
     TEXT = "TEXT"
     IMAGE = "IMAGE"
     AUDIO = "AUDIO"
